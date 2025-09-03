@@ -1,0 +1,9 @@
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"  # porque tus requirements.txt están en la raíz
+    schedule:
+      interval: "daily"  # también puedes usar "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
