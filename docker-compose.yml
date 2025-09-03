@@ -1,0 +1,21 @@
+version: '3'
+
+services: 
+  template_worker:
+    build:
+      context: .
+      args:
+        - AWS_ACCESS_KEY_ID
+        - AWS_SECRET_ACCESS_KEY
+    platform: linux/amd64
+    environment:
+      - KAFKA_HOST=kafka:9092
+      - MONGO_HOST=mongodb://root:password@mongo:27017
+      - POSTGRES_HOST=postgres
+    networks:
+      - copan_network
+   
+  
+networks:
+  copan_network:
+    external: true

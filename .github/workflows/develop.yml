@@ -1,0 +1,125 @@
+name: Build and Deploy DEV
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+env:
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY_NAME }}
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+  
+jobs:
+  sonar-scan:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.head_ref }}
+
+      - name: SonarQube Scan
+        uses: sonarsource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      # Espera el resultado del análisis
+      - name: SonarQube Quality Gate check
+        id: sonarqube-quality-gate-check
+        uses: sonarsource/sonarqube-quality-gate-action@master
+        with:
+          pollingTimeoutSec: 120
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+        # Optionally you can use the output from the Quality Gate in another step.
+        # The possible outputs of the `quality-gate-status` variable are `PASSED`, `WARN` or `FAILED`.
+      - name: "Show SonarQube Quality Gate Status value"
+        run: echo "The Quality Gate status is ${{ steps.sonarqube-quality-gate-check.outputs.quality-gate-status }}"
+
+
+  build-and-push:
+    name: Build and push to ECR
+    runs-on: ubuntu-24.04
+    needs: [sonar-scan]
+    if: ${{ needs.sonar-scan.result == 'success' }}
+
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Python configuration
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHub-Actions-ECR-Push
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Generate image tag
+        id: image-tag
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          IMAGE_TAG="develop-${SHORT_SHA}"
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "SHORT_SHA=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "Generated image tag: ${IMAGE_TAG}"
+
+      - name: Build Docker image
+        id: image-build
+        run: |
+          export DOCKER_BUILDKIT="1" 
+
+          docker build --secret id=aws_access_key_id,env=AWS_ACCESS_KEY_ID \
+                       --secret id=aws_secret_access_key,env=AWS_SECRET_ACCESS_KEY \
+                       --secret id=aws_session_token,env=AWS_SESSION_TOKEN \
+                       --build-arg BUILD_DATE="$(date +"%F")" \
+                       --build-arg VERSION="${{ steps.image-tag.outputs.IMAGE_TAG }}" \
+                       --build-arg GIT_COMMIT="${{ steps.image-tag.outputs.SHORT_SHA }}" \
+                       -t ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.image-tag.outputs.IMAGE_TAG }} \
+                       -t ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:develop \
+                       -f Dockerfile .
+
+      - name: Push Docker image to ECR
+        run: |
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.image-tag.outputs.IMAGE_TAG }}
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:develop
+
+      - name: Image scan results
+        run: |
+          aws ecr describe-image-scan-findings \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --image-id imageTag=${{ steps.image-tag.outputs.IMAGE_TAG }} \
+            --query 'imageScanFindings.findingCounts' || echo "Scan still in progress"
+      
+      - name: Deployment summary
+        run: |
+          echo "## 🚀 DEV Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch**: dev" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ steps.image-tag.outputs.SHORT_SHA }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.image-tag.outputs.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: DEV (auto-deploy)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build Date**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ✅ Image pushed to ECR successfully" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps:" >> $GITHUB_STEP_SUMMARY
+          echo "1. Verify image in ECR console" >> $GITHUB_STEP_SUMMARY
+          echo "2. Deploy to DEV environment: \`kubectl set image deployment/${{ env.ECR_REPOSITORY }} app=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.image-tag.outputs.IMAGE_TAG }} -n ${{ env.ECR_REPOSITORY }}-dev\`" >> $GITHUB_STEP_SUMMARY

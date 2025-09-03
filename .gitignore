@@ -1,0 +1,40 @@
+# Archivos y carpetas generados por Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Carpeta de entorno virtual de Python (por ejemplo, virtualenv o venv)
+venv/
+env/
+
+# Carpeta de dependencias de Python
+lib/
+libs/
+dist/
+build/
+egg-info/
+
+# Archivos de registro y salida
+*.log
+*.pot
+*.pyc
+*.swp
+
+# Carpeta de configuración de Visual Studio Code
+.vscode/
+
+# Carpeta de caché de Visual Studio Code
+.vscode-server/
+
+# Carpeta de caché de Python
+.python/
+
+# Carpeta de archivos temporales
+*.bak
+*.tmp
+
+# Otros archivos y carpetas que deseas excluir
+.DS_Store
+.pytest_cache/
+.coverage
+htmlcov/

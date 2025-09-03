@@ -1,0 +1,22 @@
+# Archivos y carpetas generados por Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Carpeta de entorno virtual de Python (por ejemplo, virtualenv o venv)
+venv/
+env/
+
+# Carpeta de dependencias de Python
+lib/
+libs/
+dist/
+build/
+*.egg-info/
+
+# Archivos de registro y salida
+*.log
+*.pot
+
+# Otros archivos y carpetas que deseas excluir

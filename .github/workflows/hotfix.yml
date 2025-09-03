@@ -1,0 +1,175 @@
+name: Hotfix Build and Deploy
+
+on:
+  push:
+    branches: 
+      - 'hotfix/*'
+  workflow_dispatch:
+
+env:
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY_NAME }}
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+
+jobs:
+  hotfix-build-deploy:
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+      contents: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+    
+      - name: Python configuration
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+      
+      - name: Generate hotfix version
+        id: version
+        run: |
+          BRANCH_NAME=${GITHUB_REF#refs/heads/}
+          echo "Branch: $BRANCH_NAME"
+          
+          # Get the latest production tag
+          LATEST_PROD=$(git tag -l "v*.*.*" --sort=-version:refname | grep -v "rc" | head -1 || echo "v1.0.0")
+          echo "Latest production version: $LATEST_PROD"
+          
+          # Generate patch version for hotfix
+          if [[ $LATEST_PROD =~ v([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+            MAJOR=${BASH_REMATCH[1]}
+            MINOR=${BASH_REMATCH[2]}
+            PATCH=$((${BASH_REMATCH[3]} + 1))
+            HOTFIX_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+          else
+            # Fallback
+            HOTFIX_VERSION="v1.0.1"
+          fi
+          
+          echo "Generated hotfix version: $HOTFIX_VERSION"
+          echo "HOTFIX_VERSION=${HOTFIX_VERSION}" >> $GITHUB_OUTPUT
+          echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "BRANCH_NAME=${BRANCH_NAME}" >> $GITHUB_OUTPUT
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume:  ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHub-Actions-Hotfix
+      
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+      
+      - name: Build hotfix Docker image
+        run: |
+          export DOCKER_BUILDKIT="1"
+
+          docker build --secret id=aws_access_key_id,env=AWS_ACCESS_KEY_ID \
+                    --secret id=aws_secret_access_key,env=AWS_SECRET_ACCESS_KEY \
+                    --secret id=aws_session_token,env=AWS_SESSION_TOKEN \
+                    --build-arg BUILD_DATE="$(date +"%F")" \
+                    --build-arg VERSION="${{ steps.version.outputs.HOTFIX_VERSION }}" \
+                    --build-arg GIT_COMMIT="${{ steps.version.outputs.SHORT_SHA }}" \
+                    -t ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.HOTFIX_VERSION }} \
+                    -t ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:hotfix-latest \
+                    -f Dockerfile .
+
+      - name: Push hotfix image to ECR
+        run: |
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.HOTFIX_VERSION }}
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:hotfix-latest
+      
+      - name: Create hotfix Git tag
+        run: |
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git tag ${{ steps.version.outputs.HOTFIX_VERSION }}
+          git push origin ${{ steps.version.outputs.HOTFIX_VERSION }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Create hotfix release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.version.outputs.HOTFIX_VERSION }}
+          release_name: Hotfix ${{ steps.version.outputs.HOTFIX_VERSION }}
+          body: |
+            ## 🚨 Critical Hotfix ${{ steps.version.outputs.HOTFIX_VERSION }}
+            
+            **Branch**: ${{ steps.version.outputs.BRANCH_NAME }}
+            **Commit**: ${{ steps.version.outputs.SHORT_SHA }}
+            **Deploy Date**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+            
+            ### 🔧 Hotfix Details:
+            This is a critical hotfix that requires immediate deployment to production.
+            
+            ### 📊 Deployment Info:
+            - **Image**: `${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.HOTFIX_VERSION }}`
+            - **Priority**: Critical
+            - **Auto-Deploy**: Ready for immediate production deployment
+            
+            ### 🚀 Deployment Commands:
+            
+            **Production:**
+            ```bash
+            kubectl set image deployment/${{ env.ECR_REPOSITORY }} \
+              app=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.HOTFIX_VERSION }} \
+              --namespace ${{ env.ECR_REPOSITORY }}
+            ```
+            
+            **QA (for verification):**
+            ```bash
+            kubectl set image deployment/${{ env.ECR_REPOSITORY }} \
+              app=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.HOTFIX_VERSION }} \
+              --namespace ${{ env.ECR_REPOSITORY }}-qa
+            ```
+            
+            ### 🔄 Propagation Required:
+            After production deployment, propagate this fix to other branches:
+            ```bash
+            git cherry-pick ${{ steps.version.outputs.SHORT_SHA }}  # to qa branch
+            git cherry-pick ${{ steps.version.outputs.SHORT_SHA }}  # to develop branch
+            ```
+          draft: false
+          prerelease: false
+      
+      - name: Hotfix summary
+        run: |
+          echo "## 🚨 Hotfix Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ steps.version.outputs.HOTFIX_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch**: ${{ steps.version.outputs.BRANCH_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: ${{ steps.version.outputs.SHORT_SHA }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.HOTFIX_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Priority**: 🚨 Critical" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ✅ Ready for immediate deployment" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🚀 Immediate Actions Required:" >> $GITHUB_STEP_SUMMARY
+          echo "1. **Deploy to Production**: Use deployment command from release" >> $GITHUB_STEP_SUMMARY
+          echo "2. **Verify Fix**: Test critical functionality" >> $GITHUB_STEP_SUMMARY
+          echo "3. **Propagate Fix**: Cherry-pick to qa and develop branches" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📋 Cherry-pick Commands:" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "# Apply to QA branch" >> $GITHUB_STEP_SUMMARY
+          echo "git checkout qa" >> $GITHUB_STEP_SUMMARY
+          echo "git cherry-pick ${{ steps.version.outputs.SHORT_SHA }}" >> $GITHUB_STEP_SUMMARY
+          echo "git push origin qa" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# Apply to develop branch" >> $GITHUB_STEP_SUMMARY
+          echo "git checkout develop" >> $GITHUB_STEP_SUMMARY
+          echo "git cherry-pick ${{ steps.version.outputs.SHORT_SHA }}" >> $GITHUB_STEP_SUMMARY
+          echo "git push origin develop" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY

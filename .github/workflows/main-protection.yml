@@ -1,0 +1,22 @@
+name: Protect MAIN Branch
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate-source-branch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if source branch is hotfix/* or qa
+        run: |
+          echo "🔍 Validando rama fuente: '${{ github.head_ref }}'"
+
+          if [[ "${{ github.head_ref }}" == qa ]] || [[ "${{ github.head_ref }}" == hotfix/* ]]; then
+            echo "✅ Rama ${{ github.head_ref }} válida para hacer PR a main"
+          else
+            echo "❌ Solo se permiten PR desde ramas: 'hotfix/*' o 'qa'"
+            echo "Rama actual: ${{ github.head_ref }}"
+            exit 1
+          fi
+

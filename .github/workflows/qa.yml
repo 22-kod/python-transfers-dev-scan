@@ -1,0 +1,211 @@
+name: Promote to QA
+
+on:
+  push:
+    branches: [qa]
+  workflow_dispatch:
+
+env:
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+  ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY_NAME }}
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+
+jobs:
+  sonar-scan:
+    name: sonar-analyse
+    runs-on: ubuntu-24.04
+    if: |
+      !contains(github.event.head_commit.message, 'bump:')
+    outputs:
+      quality-gate-status: ${{ steps.sonarqube-quality-gate-check.outputs.quality-gate-status }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: SonarQube Scan
+        uses: sonarsource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      # Espera el resultado del análisis
+      - name: SonarQube Quality Gate check
+        id: sonarqube-quality-gate-check
+        uses: sonarsource/sonarqube-quality-gate-action@master
+        with:
+          pollingTimeoutSec: 120
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+        #Use the output from the Quality Gate in another step.
+        # The possible outputs of the `quality-gate-status` variable are `PASSED`, `WARN` or `FAILED`.
+      - name: 'Show SonarQube Quality Gate Status value'
+        run: echo "The Quality Gate status is ${{ steps.sonarqube-quality-gate-check.outputs.quality-gate-status }}"
+
+  # COMPILACIÓN DE QA
+  promote-to-qa:
+    runs-on: ubuntu-24.04
+    needs: [sonar-scan]
+    if: |
+      !contains(github.event.head_commit.message, 'bump:') &&
+      ${{ (needs.sonar-scan.result == 'success' ) }}
+
+    permissions:
+      id-token: write
+      contents: write
+
+    steps:
+      - name: Print SonarQube Quality Gate Status
+        run: |
+          echo "SonarQube Quality Gate Status: ${{ needs.sonar-scan.outputs.quality-gate-status }}"
+
+      - name: Fail if SonarQube Quality Gate failed
+        if: ${{ needs.sonar-scan.outputs.quality-gate-status != 'PASSED' }}
+        run: |
+          echo "❌ SonarQube Quality Gate did not pass: ${{ needs.sonar-scan.outputs.quality-gate-status }}"
+          exit 1
+
+      - name: Generate App Token
+        uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+
+      - name: Checkout code with App Token
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          fetch-depth: 0
+          ref: ${{ github.head_ref }}
+
+      - name: Python configuration
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Configure Git
+        run: |
+          #Registro de la llave para firmar el commit
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | base64 --decode | gpg --batch --import
+          echo $(gpg --list-secret-keys --with-colons | grep '^sec' | cut -d':' -f5)
+          KEY_ID=$(gpg --list-secret-keys --with-colons | grep '^sec' | cut -d':' -f5)
+
+          git config --global user.name "${{ secrets.GPG_KEY_NAME }}"
+          git config --global user.email "${{ secrets.GPG_KEY_EMAIL }}"
+          git config commit.gpgsign true
+          git config --global user.signingkey "$KEY_ID"
+
+          echo "GPG_KEY_ID=$KEY_ID" >> $GITHUB_ENV
+          echo "GPG_TTY=$(tty)" >> $GITHUB_ENV
+
+      - name: Install Commitizen
+        run: |
+          python -m pip install --upgrade pip
+          pip install commitizen
+
+      - name: Show cz version
+        run: cz version
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHub-Actions-QA-Promote
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Generate semantic version
+        id: version
+        run: |
+          BRANCH_NAME=${GITHUB_REF#refs/heads/}
+          echo "Branch: $BRANCH_NAME"
+
+          # Generate version based on conventional commits
+          # This will analyze commits since last tag and generate appropriate version
+          DATE=$(date +%Y%m%d%H%M)
+
+          if command -v cz &> /dev/null; then
+            echo "Commitizen está instalado. Ejecutando cz bump..."
+            # Ejecuta cz bump
+            cz bump --yes || exit 1
+
+            # Intenta obtener el nuevo tag generado
+            NEW_TAG=$(git describe --tags --abbrev=0)
+
+            if [ -z "$NEW_TAG" ]; then
+              echo "❌ No se generó un nuevo tag con cz bump. Saliendo del job."
+              exit 1
+            fi
+
+            SHORT_SHA=$(git rev-parse --short HEAD)
+            VERSION="${NEW_TAG}-rc.${SHORT_SHA}.${DATE}"
+            echo "✅ Versión generada: $VERSION"
+          else
+            echo "⚠️ Commitizen no está instalado. Saliendo del job."
+            exit 1
+          fi
+
+          # Firma y exporta resultados
+          git tag -s "${VERSION}" -m "bump: version ${VERSION}"
+
+          echo "NEW_TAG=${NEW_TAG}" >> $GITHUB_OUTPUT
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+          echo "BRANCH_NAME=${BRANCH_NAME}" >> $GITHUB_OUTPUT
+          echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+      - name: Build Docker image
+        run: |
+          git checkout tags/${{ steps.version.outputs.NEW_TAG }}
+          export DOCKER_BUILDKIT="1" 
+
+          docker build --secret id=aws_access_key_id,env=AWS_ACCESS_KEY_ID \
+              --secret id=aws_secret_access_key,env=AWS_SECRET_ACCESS_KEY \
+              --secret id=aws_session_token,env=AWS_SESSION_TOKEN \
+              --build-arg BUILD_DATE="$(date +"%F")" \
+              --build-arg VERSION="${{ steps.version.outputs.VERSION }}" \
+              --build-arg GIT_COMMIT="${{ steps.version.outputs.SHORT_SHA }}" \
+              -t ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.VERSION }} \
+              -f Dockerfile .
+
+      - name: Push Docker image to ECR
+        run: |
+          docker push ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.VERSION }}
+
+      - name: Create Git tag
+        run: |
+          echo "Versión generada: ${{ steps.version.outputs.VERSION }}"
+          git push origin ${{ steps.version.outputs.VERSION }}
+          git push origin ${{ steps.version.outputs.NEW_TAG }}
+
+          git checkout ${{ steps.version.outputs.BRANCH_NAME }}
+          git push origin ${{ steps.version.outputs.BRANCH_NAME }}
+
+          echo "Push del tag completado"
+
+      - name: QA promotion summary
+        run: |
+          echo "## 🚀 QA Promotion Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Source**: release branch → qa branch" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Action**: Promote existing image (no rebuild)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: QA" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ✅ Ready for QA deployment" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Deployment Command:" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "kubectl set image deployment/${{ env.ECR_REPOSITORY }} \\" >> $GITHUB_STEP_SUMMARY
+          echo "  app=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ steps.version.outputs.VERSION }} \\" >> $GITHUB_STEP_SUMMARY
+          echo "  --namespace ${{ env.ECR_REPOSITORY }}-qa" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps:" >> $GITHUB_STEP_SUMMARY
+          echo "1. Modify the Parameter Store." >> $GITHUB_STEP_SUMMARY
+          echo "2. Run Release from CodePipeline." >> $GITHUB_STEP_SUMMARY
+          echo "3. Run QA Testing." >> $GITHUB_STEP_SUMMARY
+          echo "4. Create PR: qa → main for production deployment." >> $GITHUB_STEP_SUMMARY

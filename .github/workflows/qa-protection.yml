@@ -1,0 +1,18 @@
+name: Protect QA Branch
+
+on:
+  pull_request:
+    branches: [qa]
+
+jobs:
+  validate-source-branch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if source branch is release/*
+        run: |
+          if [[ "${{ github.head_ref }}" != release/* ]]; then
+            echo "❌ Solo se permiten PR desde ramas 'release/*'"
+            echo "Rama actual: ${{ github.head_ref }}"
+            exit 1
+          fi
+          echo "✅ Rama release/* válida"
