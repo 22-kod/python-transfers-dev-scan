@@ -1,7 +1,7 @@
 protobuf==5.29.5
 ds-protobus==5.14.0
 ds-security-validation==1.4.0
-fastapi==0.108.0
+fastapi==0.116.1
 okta-jwt-verifier==0.2.4
 pendulum==3.0.0
 uvicorn==0.25.0
