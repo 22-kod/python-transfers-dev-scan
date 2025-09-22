@@ -4,7 +4,7 @@ ds-security-validation==1.4.0
 fastapi==0.108.0
 okta-jwt-verifier==0.2.4
 pendulum==3.0.0
-uvicorn==0.25.0
+uvicorn==0.36.0
 uuid7==0.1.0
 result==0.16.0
 redis==5.0.2
